@@ -1,0 +1,7 @@
+Flask
+pandas
+openpyxl
+pdfplumber
+Pillow
+pytesseract
+gunicorn
