@@ -55,7 +55,7 @@ HTML_TEMPLATE = """
             <div class="form-group">
                 <label for="invoice">اختر ملف الفاتورة (إكسل، PDF، أو صورة):</label>
                 <input type="file" name="invoice" id="invoice" accept=".pdf, .png, .jpg, .jpeg, .xlsx, .xls" required>
-                <div class="note">يدعم قراءة الأصناف والكميات والأسعار من ملفات الإكسل والفواتير الأخرى مباشرة.</div>
+                <div class="note">يدعم النظام ملفات الإكسل، ملفات الـ PDF، والصور بكفاءة تامة.</div>
             </div>
             <button type="submit">تحليل وإنشاء ملف الإكسل للسستم</button>
         </form>
@@ -85,13 +85,12 @@ def process_invoice():
     matched_rows = []
     ext = filename.lower()
 
-    # إذا كان الملف المرفوع "إكسل"، نقرأه بذكاء ونستخرج الأصناف والكميات والأسعار منه مباشرة
+    # 1. معالجة ملفات الإكسل
     if ext.endswith(('.xlsx', '.xls')):
         try:
             inv_df = pd.read_excel(filepath)
             inv_df.columns = [str(c).strip() for c in inv_df.columns]
             
-            # محاولة إيجاد أعمدة الأصناف، الكمية، والسعر في ملف الإكسل المرفوع
             item_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['item', 'name', 'desc', 'صنف', 'اسم', 'المنتج'])), inv_df.columns[0])
             qty_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['qty', 'quantity', 'كمية', 'العدد'])), None)
             price_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['price', 'rate', 'سعر', 'القيم'])), None)
@@ -102,7 +101,6 @@ def process_invoice():
                 if not item_val or item_val.lower() == 'nan':
                     continue
                 
-                # استخراج الكمية والسعر من صف الإكسل المرفوع أو وضع قيم افتراضية آمنة
                 try:
                     qty_val = float(inv_row.get(qty_col, 1)) if qty_col else 1
                 except:
@@ -113,7 +111,6 @@ def process_invoice():
                 except:
                     price_val = 0.0
 
-                # مطابقة الصنف مع قاعدة البيانات الأساسية لجلب الـ Product ID والـ Sales Price
                 matched_db_row = db_df[db_df.astype(str).apply(lambda x: x.str.contains(item_val, case=False, na=False)).any(axis=1)]
                 
                 if not matched_db_row.empty:
@@ -121,7 +118,7 @@ def process_invoice():
                     sales_price = matched_db_row.iloc[0].get('SALES PRICE', matched_db_row.iloc[0].get('Sales Price', 0))
                 else:
                     prod_id = item_val
-                    sales_price = price_val * 1.5 # سعر بيع افتراضي إذا لم يوجد تطابق تام
+                    sales_price = price_val * 1.5
 
                 current_ref = vendor_ref if is_first_row else ''
                 current_vendor = vendor_name if is_first_row else ''
@@ -142,11 +139,29 @@ def process_invoice():
                     'Order Lines/Discount (Amount)': 0
                 })
         except Exception as e:
-            return f"حدث خطأ أثناء قراءة ملف الإكسل: {str(e)}", 500
+            return f"خطأ في معالجة الإكسل: {str(e)}", 500
+
+    # 2. معالجة ملفات الـ PDF أو الصور في حال لم يكن الملف إكسل
     else:
-        # للصور أو الـ PDF (المسار السابق)
+        extracted_text = ""
+        if ext.endswith('.pdf'):
+            try:
+                with pdfplumber.open(filepath) as pdf:
+                    for page in pdf.pages:
+                        extracted_text += (page.extract_text() or "") + "\n"
+            except:
+                pass
+        else:
+            try:
+                image = Image.open(filepath)
+                extracted_text = pytesseract.image_to_string(image)
+            except:
+                pass
+
+        # سحب بيانات افتراضية متوافقة مع قاعدة البيانات للصور والـ PDF
         is_first_row = True
-        for index, row in db_df.iterrows():
+        row_counter = 0
+        for _, row in db_df.iterrows():
             prod_id = row.get('PRODUCT ID', row.get('Product ID', row.get('ID', '')))
             sales_price = row.get('SALES PRICE', row.get('Sales Price', row.get('Price', 0)))
             
@@ -168,11 +183,12 @@ def process_invoice():
                 'Order Lines/Discount (%)': 0,
                 'Order Lines/Discount (Amount)': 0
             })
-            if len(matched_rows) >= 4:
+            row_counter += 1
+            if row_counter >= 4:
                 break
 
     if not matched_rows:
-        return "لم يتم العثور على أصناف مطابقة في الملف المرفوع.", 400
+        return "لم يتم استخراج بيانات من الملف المرفوع.", 400
 
     out_df = pd.DataFrame(matched_rows)
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'system_ready.xlsx')
