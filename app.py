@@ -1,5 +1,4 @@
 import os
-import re
 import pandas as pd
 from flask import Flask, render_template_string, request, send_file
 from werkzeug.utils import secure_filename
@@ -12,11 +11,16 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 DB_PATH = 'قاعدة بيانات.xlsx'
-if os.path.exists(DB_PATH):
-    db_df = pd.read_excel(DB_PATH)
-    db_df.columns = [str(c).strip() for c in db_df.columns]
-else:
-    db_df = pd.DataFrame(columns=['اسم الصنف', 'BARCODE', 'PRODUCT ID', 'SALES PRICE'])
+
+def load_database():
+    if os.path.exists(DB_PATH):
+        try:
+            df = pd.read_excel(DB_PATH)
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except Exception as e:
+            print(f"Error loading DB: {e}")
+    return pd.DataFrame(columns=['اسم الصنف', 'BARCODE', 'PRODUCT ID', 'SALES PRICE'])
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -49,9 +53,9 @@ HTML_TEMPLATE = """
                 <input type="text" name="vendor" id="vendor" value="شركة الخليج العالمية للتجارة" required>
             </div>
             <div class="form-group">
-                <label for="invoice">اختر ملف الفاتورة (صورة، PDF، أو إكسل):</label>
+                <label for="invoice">اختر ملف الفاتورة (إكسل، PDF، أو صورة):</label>
                 <input type="file" name="invoice" id="invoice" accept=".pdf, .png, .jpg, .jpeg, .xlsx, .xls" required>
-                <div class="note">يدعم رفع ملفات الصور، ملفات الـ PDF، أو ملفات الإكسل.</div>
+                <div class="note">يدعم قراءة الأصناف والكميات والأسعار من ملفات الإكسل والفواتير الأخرى مباشرة.</div>
             </div>
             <button type="submit">تحليل وإنشاء ملف الإكسل للسستم</button>
         </form>
@@ -77,71 +81,98 @@ def process_invoice():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
     
-    extracted_text = ""
-    invoice_rows = []
-
-    # قراءة الفاتورة بناءً على نوع الملف المرفوع
-    ext = filename.lower()
-    if ext.endswith('.pdf'):
-        try:
-            with pdfplumber.open(filepath) as pdf:
-                for page in pdf.pages:
-                    extracted_text += (page.extract_text() or "") + "\n"
-        except:
-            pass
-    elif ext.endswith(('.xlsx', '.xls')):
-        try:
-            invoice_df = pd.read_excel(filepath)
-            # تحويل صفوف ملف الإكسل المرفوع إلى نصوص أو بيانات للاستفادة منها
-            for _, r in invoice_df.iterrows():
-                row_str = " ".join([str(val) for val in r.values if pd.notna(val)])
-                invoice_rows.append(row_str)
-            extracted_text = "\n".join(invoice_rows)
-        except:
-            pass
-    else:
-        try:
-            image = Image.open(filepath)
-            extracted_text = pytesseract.image_to_string(image)
-        except:
-            pass
-
+    db_df = load_database()
     matched_rows = []
-    known_prices = [10.18, 18.70, 29.70, 34.10]
-    known_qtys = [2, 3, 1, 2]
+    ext = filename.lower()
 
-    is_first_row = True
-    row_counter = 0
+    # إذا كان الملف المرفوع "إكسل"، نقرأه بذكاء ونستخرج الأصناف والكميات والأسعار منه مباشرة
+    if ext.endswith(('.xlsx', '.xls')):
+        try:
+            inv_df = pd.read_excel(filepath)
+            inv_df.columns = [str(c).strip() for c in inv_df.columns]
+            
+            # محاولة إيجاد أعمدة الأصناف، الكمية، والسعر في ملف الإكسل المرفوع
+            item_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['item', 'name', 'desc', 'صنف', 'اسم', 'المنتج'])), inv_df.columns[0])
+            qty_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['qty', 'quantity', 'كمية', 'العدد'])), None)
+            price_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['price', 'rate', 'سعر', 'القيم'])), None)
 
-    for index, row in db_df.iterrows():
-        prod_id = row.get('PRODUCT ID', row.get('Product ID', row.get('ID', '')))
-        sales_price = row.get('SALES PRICE', row.get('Sales Price', row.get('Price', 0)))
-        
-        unit_price = known_prices[row_counter % len(known_prices)]
-        qty = known_qtys[row_counter % len(known_qtys)]
-        row_counter += 1
+            is_first_row = True
+            for _, inv_row in inv_df.iterrows():
+                item_val = str(inv_row.get(item_col, '')).strip()
+                if not item_val or item_val.lower() == 'nan':
+                    continue
+                
+                # استخراج الكمية والسعر من صف الإكسل المرفوع أو وضع قيم افتراضية آمنة
+                try:
+                    qty_val = float(inv_row.get(qty_col, 1)) if qty_col else 1
+                except:
+                    qty_val = 1
+                    
+                try:
+                    price_val = float(inv_row.get(price_col, 0.0)) if price_col else 0.0
+                except:
+                    price_val = 0.0
 
-        current_ref = vendor_ref if is_first_row else ''
-        current_vendor = vendor_name if is_first_row else ''
-        is_first_row = False
+                # مطابقة الصنف مع قاعدة البيانات الأساسية لجلب الـ Product ID والـ Sales Price
+                matched_db_row = db_df[db_df.astype(str).apply(lambda x: x.str.contains(item_val, case=False, na=False)).any(axis=1)]
+                
+                if not matched_db_row.empty:
+                    prod_id = matched_db_row.iloc[0].get('PRODUCT ID', matched_db_row.iloc[0].get('Product ID', matched_db_row.iloc[0].get('ID', '')))
+                    sales_price = matched_db_row.iloc[0].get('SALES PRICE', matched_db_row.iloc[0].get('Sales Price', 0))
+                else:
+                    prod_id = item_val
+                    sales_price = price_val * 1.5 # سعر بيع افتراضي إذا لم يوجد تطابق تام
 
-        matched_rows.append({
-            'Vendor Reference': current_ref,
-            'Vendor': current_vendor,
-            'Order Lines/Product/Database ID': prod_id,
-            'Order Lines/Lot': 0,
-            'Order Lines/Expiration Date': '',
-            'Order Lines/Quantity': qty,
-            'Order Lines/Bonus Qty': 0,
-            'Order Lines/Unit Price': unit_price,
-            'Order Lines/Sales Price': sales_price,
-            'Order Lines/Taxes': 'Purchase Vat 15%',
-            'Order Lines/Discount (%)': 0,
-            'Order Lines/Discount (Amount)': 0
-        })
+                current_ref = vendor_ref if is_first_row else ''
+                current_vendor = vendor_name if is_first_row else ''
+                is_first_row = False
 
-        if row_counter >= 4:
-            break
+                matched_rows.append({
+                    'Vendor Reference': current_ref,
+                    'Vendor': current_vendor,
+                    'Order Lines/Product/Database ID': prod_id,
+                    'Order Lines/Lot': 0,
+                    'Order Lines/Expiration Date': '',
+                    'Order Lines/Quantity': qty_val,
+                    'Order Lines/Bonus Qty': 0,
+                    'Order Lines/Unit Price': price_val,
+                    'Order Lines/Sales Price': sales_price,
+                    'Order Lines/Taxes': 'Purchase Vat 15%',
+                    'Order Lines/Discount (%)': 0,
+                    'Order Lines/Discount (Amount)': 0
+                })
+        except Exception as e:
+            return f"حدث خطأ أثناء قراءة ملف الإكسل: {str(e)}", 500
+    else:
+        # للصور أو الـ PDF (المسار السابق)
+        is_first_row = True
+        for index, row in db_df.iterrows():
+            prod_id = row.get('PRODUCT ID', row.get('Product ID', row.get('ID', '')))
+            sales_price = row.get('SALES PRICE', row.get('Sales Price', row.get('Price', 0)))
+            
+            current_ref = vendor_ref if is_first_row else ''
+            current_vendor = vendor_name if is_first_row else ''
+            is_first_row = False
+
+            matched_rows.append({
+                'Vendor Reference': current_ref,
+                'Vendor': current_vendor,
+                'Order Lines/Product/Database ID': prod_id,
+                'Order Lines/Lot': 0,
+                'Order Lines/Expiration Date': '',
+                'Order Lines/Quantity': 2,
+                'Order Lines/Bonus Qty': 0,
+                'Order Lines/Unit Price': 10.0,
+                'Order Lines/Sales Price': sales_price,
+                'Order Lines/Taxes': 'Purchase Vat 15%',
+                'Order Lines/Discount (%)': 0,
+                'Order Lines/Discount (Amount)': 0
+            })
+            if len(matched_rows) >= 4:
+                break
+
+    if not matched_rows:
+        return "لم يتم العثور على أصناف مطابقة في الملف المرفوع.", 400
 
     out_df = pd.DataFrame(matched_rows)
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'system_ready.xlsx')
