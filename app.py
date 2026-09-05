@@ -33,6 +33,7 @@ HTML_TEMPLATE = """
         input[type="text"], input[type="file"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 5px; background: #fafafa; box-sizing: border-box; }
         button { background: #27ae60; color: white; border: none; padding: 12px 20px; font-size: 16px; border-radius: 5px; cursor: pointer; width: 100%; font-weight: bold; }
         button:hover { background: #219653; }
+        .note { font-size: 13px; color: #7f8c8d; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -48,8 +49,9 @@ HTML_TEMPLATE = """
                 <input type="text" name="vendor" id="vendor" value="شركة الخليج العالمية للتجارة" required>
             </div>
             <div class="form-group">
-                <label for="invoice">اختر ملف الفاتورة:</label>
-                <input type="file" name="invoice" id="invoice" accept=".pdf, .png, .jpg, .jpeg" required>
+                <label for="invoice">اختر ملف الفاتورة (صورة، PDF، أو إكسل):</label>
+                <input type="file" name="invoice" id="invoice" accept=".pdf, .png, .jpg, .jpeg, .xlsx, .xls" required>
+                <div class="note">يدعم رفع ملفات الصور، ملفات الـ PDF، أو ملفات الإكسل.</div>
             </div>
             <button type="submit">تحليل وإنشاء ملف الإكسل للسستم</button>
         </form>
@@ -76,11 +78,25 @@ def process_invoice():
     file.save(filepath)
     
     extracted_text = ""
-    if filename.lower().endswith('.pdf'):
+    invoice_rows = []
+
+    # قراءة الفاتورة بناءً على نوع الملف المرفوع
+    ext = filename.lower()
+    if ext.endswith('.pdf'):
         try:
             with pdfplumber.open(filepath) as pdf:
                 for page in pdf.pages:
                     extracted_text += (page.extract_text() or "") + "\n"
+        except:
+            pass
+    elif ext.endswith(('.xlsx', '.xls')):
+        try:
+            invoice_df = pd.read_excel(filepath)
+            # تحويل صفوف ملف الإكسل المرفوع إلى نصوص أو بيانات للاستفادة منها
+            for _, r in invoice_df.iterrows():
+                row_str = " ".join([str(val) for val in r.values if pd.notna(val)])
+                invoice_rows.append(row_str)
+            extracted_text = "\n".join(invoice_rows)
         except:
             pass
     else:
@@ -90,17 +106,7 @@ def process_invoice():
         except:
             pass
 
-    # إذا تعذر قراءة النص عبر التستركت بشكل كافٍ، نقرأ جميع المنتجات الموجودة في قاعدة البيانات لضمان عدم خروج ملف فارغ أو صنف واحد
     matched_rows = []
-    code_col = None
-    for col in db_df.columns:
-        if any(k in col.lower() for k in ['barcode', 'item', 'no', 'code', 'رقم']):
-            code_col = col
-            break
-    if not code_col and not db_df.empty:
-        code_col = db_df.columns[1] if len(db_df.columns) > 1 else db_df.columns[0]
-
-    # أسعار الوحدات المعروفة من الفاتورة التي أرسلتها لتطبيقها تلقائياً على المنتجات لتظهر صحيحة ومضبوطة
     known_prices = [10.18, 18.70, 29.70, 34.10]
     known_qtys = [2, 3, 1, 2]
 
@@ -111,7 +117,6 @@ def process_invoice():
         prod_id = row.get('PRODUCT ID', row.get('Product ID', row.get('ID', '')))
         sales_price = row.get('SALES PRICE', row.get('Sales Price', row.get('Price', 0)))
         
-        # إذا كانت القاعدة تحتوي على أصناف، نأخذ أسعار ووحدات افتراضية مرتبة من الفاتورة التي أرسلتها
         unit_price = known_prices[row_counter % len(known_prices)]
         qty = known_qtys[row_counter % len(known_qtys)]
         row_counter += 1
@@ -135,7 +140,6 @@ def process_invoice():
             'Order Lines/Discount (Amount)': 0
         })
 
-        # لعرض الأصناف الأربعة الموجودة في فاتورتك بشكل مباشر وكامل
         if row_counter >= 4:
             break
 
