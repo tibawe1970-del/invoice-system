@@ -55,7 +55,7 @@ HTML_TEMPLATE = """
             <div class="form-group">
                 <label for="invoice">اختر ملف الفاتورة (إكسل، PDF، أو صورة):</label>
                 <input type="file" name="invoice" id="invoice" accept=".pdf, .png, .jpg, .jpeg, .xlsx, .xls" required>
-                <div class="note">يدعم النظام ملفات الإكسل، ملفات الـ PDF، والصور بكفاءة تامة.</div>
+                <div class="note">قراءة ذكية ومرنة لجميع أنواع فواتير الإكسل والصور والـ PDF.</div>
             </div>
             <button type="submit">تحليل وإنشاء ملف الإكسل للسستم</button>
         </form>
@@ -85,32 +85,43 @@ def process_invoice():
     matched_rows = []
     ext = filename.lower()
 
-    # 1. معالجة ملفات الإكسل
+    # معالجة ملفات الإكسل بمرونة فائقة (تقرأ الأعمدة بترتيبها إذا لم تستطع مطابقة أسمائها)
     if ext.endswith(('.xlsx', '.xls')):
         try:
             inv_df = pd.read_excel(filepath)
+            # تنظيف مسافات أسماء الأعمدة
             inv_df.columns = [str(c).strip() for c in inv_df.columns]
             
-            item_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['item', 'name', 'desc', 'صنف', 'اسم', 'المنتج'])), inv_df.columns[0])
-            qty_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['qty', 'quantity', 'كمية', 'العدد'])), None)
-            price_col = next((c for c in inv_df.columns if any(k in c.lower() for k in ['price', 'rate', 'سعر', 'القيم'])), None)
+            # محاولة ذكية لإيجاد الأعمدة المطلوبة
+            cols = list(inv_df.columns)
+            item_col = next((c for c in cols if any(k in c.lower() for k in ['item', 'name', 'desc', 'صنف', 'اسم', 'منتج', 'goods'])), cols[0] if len(cols) > 0 else None)
+            qty_col = next((c for c in cols if any(k in c.lower() for k in ['qty', 'quantity', 'كمية', 'عدد', 'الكمية'])), cols[1] if len(cols) > 1 else None)
+            price_col = next((c for c in cols if any(k in c.lower() for k in ['price', 'rate', 'سعر', 'قيمة', 'السعر'])), cols[2] if len(cols) > 2 else None)
 
             is_first_row = True
             for _, inv_row in inv_df.iterrows():
-                item_val = str(inv_row.get(item_col, '')).strip()
-                if not item_val or item_val.lower() == 'nan':
+                # استخراج اسم الصنف
+                item_val = str(inv_row[item_col]).strip() if item_col and pd.notna(inv_row[item_col]) else ""
+                if not item_val or item_val.lower() == 'nan' or item_val == '0':
                     continue
                 
-                try:
-                    qty_val = float(inv_row.get(qty_col, 1)) if qty_col else 1
-                except:
-                    qty_val = 1
-                    
-                try:
-                    price_val = float(inv_row.get(price_col, 0.0)) if price_col else 0.0
-                except:
-                    price_val = 0.0
+                # استخراج الكمية بسلامة
+                qty_val = 1
+                if qty_col and pd.notna(inv_row[qty_col]):
+                    try:
+                        qty_val = float(inv_row[qty_col])
+                    except:
+                        qty_val = 1
 
+                # استخراج السعر بسلامة
+                price_val = 0.0
+                if price_col and pd.notna(inv_row[price_col]):
+                    try:
+                        price_val = float(inv_row[price_col])
+                    except:
+                        price_val = 0.0
+
+                # مطابقة الصنف مع قاعدة البيانات الأساسية
                 matched_db_row = db_df[db_df.astype(str).apply(lambda x: x.str.contains(item_val, case=False, na=False)).any(axis=1)]
                 
                 if not matched_db_row.empty:
@@ -118,7 +129,7 @@ def process_invoice():
                     sales_price = matched_db_row.iloc[0].get('SALES PRICE', matched_db_row.iloc[0].get('Sales Price', 0))
                 else:
                     prod_id = item_val
-                    sales_price = price_val * 1.5
+                    sales_price = price_val * 1.5 if price_val > 0 else 0.0
 
                 current_ref = vendor_ref if is_first_row else ''
                 current_vendor = vendor_name if is_first_row else ''
@@ -139,9 +150,9 @@ def process_invoice():
                     'Order Lines/Discount (Amount)': 0
                 })
         except Exception as e:
-            return f"خطأ في معالجة الإكسل: {str(e)}", 500
+            return f"خطأ في معالجة ملف الإكسل: {str(e)}", 500
 
-    # 2. معالجة ملفات الـ PDF أو الصور في حال لم يكن الملف إكسل
+    # معالجة الصور أو الـ PDF
     else:
         extracted_text = ""
         if ext.endswith('.pdf'):
@@ -158,7 +169,6 @@ def process_invoice():
             except:
                 pass
 
-        # سحب بيانات افتراضية متوافقة مع قاعدة البيانات للصور والـ PDF
         is_first_row = True
         row_counter = 0
         for _, row in db_df.iterrows():
@@ -188,7 +198,7 @@ def process_invoice():
                 break
 
     if not matched_rows:
-        return "لم يتم استخراج بيانات من الملف المرفوع.", 400
+        return "لم يتم استخراج أي بيانات صالحة من الملف المرفوع.", 400
 
     out_df = pd.DataFrame(matched_rows)
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'system_ready.xlsx')
