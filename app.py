@@ -2,9 +2,6 @@ import os
 import pandas as pd
 from flask import Flask, render_template_string, request, send_file
 from werkzeug.utils import secure_filename
-import pdfplumber
-from PIL import Image
-import pytesseract
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -42,7 +39,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h2>نظام قراءة الفواتير وتجهيز ملف النظام</h2>
+        <h2>قراءة أسماء الأصناف ومطابقتها بقاعدة البيانات</h2>
         <form action="/process" method="POST" enctype="multipart/form-data">
             <div class="form-group">
                 <label for="vendor_ref">رقم الفاتورة (Vendor Reference):</label>
@@ -53,11 +50,11 @@ HTML_TEMPLATE = """
                 <input type="text" name="vendor" id="vendor" value="شركة الخليج العالمية للتجارة" required>
             </div>
             <div class="form-group">
-                <label for="invoice">اختر ملف الفاتورة (إكسل الضريبية):</label>
-                <input type="file" name="invoice" id="invoice" accept=".xlsx, .xls, .pdf, .png, .jpg, .jpeg" required>
-                <div class="note">قراءة ذكية تتجاوز الترويسة العلوية وتستخرج الأصناف والكميات والأسعار بدقة.</div>
+                <label for="invoice">اختر ملف الفاتورة (إكسل):</label>
+                <input type="file" name="invoice" id="invoice" accept=".xlsx, .xls" required>
+                <div class="note">سيتم قراءة اسم الصنف من الفاتورة والبحث عنه لاستخراج الـ Product ID الخاص به من قاعدة البيانات.</div>
             </div>
-            <button type="submit">تحليل وإنشاء ملف الإكسل للسستم</button>
+            <button type="submit">موافقة وتحويل إلى إكسل النظام</button>
         </form>
     </div>
 </body>
@@ -87,19 +84,16 @@ def process_invoice():
 
     if ext.endswith(('.xlsx', '.xls')):
         try:
-            # قراءة ملف الإكسل بدون تحديد ترويسة ثابتة لنتمكن من البحث عن جدول الأصناف
+            # قراءة الملف بدون ترويسة أولية للبحث عن سطر الأعمدة
             raw_df = pd.read_excel(filepath, header=None)
-            
-            # البحث عن السطر الذي يحتوي على ترويسة الجدول مثل 'رقم الصنف' أو 'ITEM NO'
             header_row_idx = None
             for idx, row in raw_df.iterrows():
                 row_str = " ".join([str(val) for val in row.values if pd.notna(val)])
-                if 'رقم الصنف' in row_str or 'ITEM NO' in row_str or 'م' in row_str:
+                if 'رقم الصنف' in row_str or 'ITEM NO' in row_str or 'المواصفات' in row_str or 'DESCRIPTION' in row_str:
                     header_row_idx = idx
                     break
             
             if header_row_idx is not None:
-                # إعادة قراءة الملف بحيث تبدأ الترويسة من السطر الصحيح المكتشف
                 inv_df = pd.read_excel(filepath, skiprows=header_row_idx)
             else:
                 inv_df = pd.read_excel(filepath)
@@ -107,22 +101,22 @@ def process_invoice():
             inv_df.columns = [str(c).strip() for c in inv_df.columns]
             cols = list(inv_df.columns)
 
-            # تحديد أعمدة الصنف، الكمية، والسعر بدقة من جدول الفاتورة
-            item_col = next((c for c in cols if any(k in c.lower() for k in ['رقم الصنف', 'item', 'code', 'barcode'])), cols[1] if len(cols) > 1 else cols[0])
+            # تحديد عمود الوصف (الاسم) وعمود الكمية وعمود السعر
+            desc_col = next((c for c in cols if any(k in c.lower() for k in ['المواصفات', 'description', 'name', 'item name'])), cols[2] if len(cols) > 2 else cols[1])
             qty_col = next((c for c in cols if any(k in c.lower() for k in ['الكمية', 'qty', 'quantity'])), cols[4] if len(cols) > 4 else None)
             price_col = next((c for c in cols if any(k in c.lower() for k in ['السعر', 'price', 'unit price'])), cols[5] if len(cols) > 5 else None)
 
             is_first_row = True
             for _, inv_row in inv_df.iterrows():
-                item_val = str(inv_row.get(item_col, '')).strip()
+                desc_val = str(inv_row.get(desc_col, '')).strip()
                 
-                # استبعاد صفوف الترويسة أو الفراغات
-                if not item_val or item_val.lower() in ['nan', 'none', '0', 'م', 'item no.']:
+                # استبعاد الصفوف الفارغة أو الترويسة
+                if not desc_val or desc_val.lower() in ['nan', 'none', '0', 'م', 'item no.']:
                     continue
-                if any(k in item_val for k in ['شركة', 'رقم الفاتورة', 'تاريخ', 'الرقم الضريبي', 'المندوب']):
+                if any(k in desc_val for k in ['شركة', 'رقم الفاتورة', 'تاريخ', 'الرقم الضريبي', 'المندوب', 'المواصفات']):
                     continue
 
-                # قراءة الكمية
+                # استخراج الكمية
                 qty_val = 1
                 if qty_col and pd.notna(inv_row.get(qty_col)):
                     try:
@@ -130,7 +124,7 @@ def process_invoice():
                     except:
                         qty_val = 1
 
-                # قراءة السعر الإفرادي
+                # استخراج السعر
                 price_val = 0.0
                 if price_col and pd.notna(inv_row.get(price_col)):
                     try:
@@ -138,14 +132,17 @@ def process_invoice():
                     except:
                         price_val = 0.0
 
-                # مطابقة الصنف مع قاعدة البيانات الأساسية لجلب الـ Product ID الصحيح وسعر البيع
-                prod_id = item_val
+                # البحث عن الـ Product ID بناءً على اسم/وصف الصنف في قاعدة البيانات
+                prod_id = desc_val  # كاحتياطي لو لم يوجد مطابقة
                 sales_price = price_val * 1.5 if price_val > 0 else 0.0
 
                 if not db_df.empty:
-                    matched = db_df[db_df.astype(str).apply(lambda x: x.str.contains(item_val, case=False, na=False)).any(axis=1)]
+                    # تنظيف النص للبحث الجزئي الدقيق
+                    search_keyword = desc_val.split('\n')[0].strip() # أخذ السطر الأول من الوصف (مثل اسم المنتج إنجليزي أو عربي)
+                    matched = db_df[db_df.astype(str).apply(lambda x: x.str.contains(search_keyword, case=False, na=False)).any(axis=1)]
+                    
                     if not matched.empty:
-                        prod_id = matched.iloc[0].get('PRODUCT ID', matched.iloc[0].get('Product ID', matched.iloc[0].get('BARCODE', item_val)))
+                        prod_id = matched.iloc[0].get('PRODUCT ID', matched.iloc[0].get('Product ID', matched.iloc[0].get('BARCODE', desc_val)))
                         sales_price = matched.iloc[0].get('SALES PRICE', matched.iloc[0].get('Sales Price', sales_price))
 
                 current_ref = vendor_ref if is_first_row else ''
@@ -167,10 +164,10 @@ def process_invoice():
                     'Order Lines/Discount (Amount)': 0
                 })
         except Exception as e:
-            return f"خطأ في معالجة الفاتورة: {str(e)}", 500
+            return f"خطأ أثناء معالجة الفاتورة: {str(e)}", 500
 
     if not matched_rows:
-        return "لم يتم العثور على أصناف داخل ملف الفاتورة المرفق.", 400
+        return "لم يتم العثور على أصناف مطابقة داخل الفاتورة.", 400
 
     out_df = pd.DataFrame(matched_rows)
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'system_ready.xlsx')
